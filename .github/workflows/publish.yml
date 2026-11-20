@@ -22,5 +22,5 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/bon5co/chronos-railway:1.0.0
+            ghcr.io/bon5co/chronos-railway:1.0.1
             ghcr.io/bon5co/chronos-railway:latest

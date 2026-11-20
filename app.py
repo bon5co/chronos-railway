@@ -20,6 +20,7 @@ needs:
 
 import math
 import os
+import resource
 import socket
 import sys
 import threading
@@ -40,6 +41,11 @@ MAX_SERIES = int(os.environ.get("MAX_SERIES") or 256)
 MAX_POINTS = int(os.environ.get("MAX_POINTS") or 20_000)  # per series; the model reads its own context window
 MAX_PREDICTION_LENGTH = int(os.environ.get("MAX_PREDICTION_LENGTH") or 1024)
 MAX_BODY_MB = int(os.environ.get("MAX_BODY_MB") or 20)
+# Work caps, from measured peak memory (8 GB container): chronos-2 on 1.02M points (256 x 4000) peaked at
+# 3.5 GB, on 5.1M points at 6.1 GB; Chronos-Bolt at a horizon above its native 64 grows to 7.2 GB on only
+# 64 series, because it feeds forecasts back in. Cap the whole request, and Bolt's horizon.
+MAX_TOTAL_POINTS = int(os.environ.get("MAX_TOTAL_POINTS") or 2_000_000)  # values across all series and covariates
+BOLT_MAX_PREDICTION_LENGTH = 64
 PUBLIC_PATHS = {"/health"}
 
 # id -> (Hugging Face repo, family, parameters in millions)
@@ -121,7 +127,8 @@ def health():
     if not _state["ready"]:
         body = {"status": "loading" if not _state["error"] else "failed", "error": _state["error"]}
         return JSONResponse(body, status_code=503)
-    return {"status": "ok", "model": DEFAULT_MODEL, "threads": CPU_THREADS, "loaded_in_s": _state["loaded_in"]}
+    return {"status": "ok", "model": DEFAULT_MODEL, "threads": CPU_THREADS, "loaded_in_s": _state["loaded_in"],
+            "peak_rss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)}
 
 
 @app.get("/v1/models")
@@ -206,9 +213,12 @@ def forecast(req: ForecastRequest):
         _bad(f"prediction_length must be between 1 and {MAX_PREDICTION_LENGTH}")
     if not req.quantiles or len(req.quantiles) > 20 or any(not 0.0 < q < 1.0 for q in req.quantiles):
         _bad("quantiles must be 1 to 20 levels strictly between 0 and 1")
+    if family == "bolt" and req.prediction_length > BOLT_MAX_PREDICTION_LENGTH:
+        _bad(f"{req.model} forecasts at most {BOLT_MAX_PREDICTION_LENGTH} steps; use model chronos-2 for a longer horizon")
     levels = sorted(set(round(float(q), 4) for q in req.quantiles))
 
     inputs, past, future = [], [], []
+    total = 0
     uses_cov = any(s.past_covariates or s.future_covariates for s in req.series)
     if uses_cov and family != "chronos2":
         _bad("covariates are supported by chronos-2 only", 400)
@@ -221,6 +231,9 @@ def forecast(req: ForecastRequest):
         label = s.id or f"series_{i}"
         if not 3 <= len(s.values) <= MAX_POINTS:
             _bad(f"{label}: send between 3 and {MAX_POINTS} values")
+        total += len(s.values) * (1 + len(s.past_covariates or {}))
+        if total > MAX_TOTAL_POINTS:
+            _bad(f"request carries more than {MAX_TOTAL_POINTS} values in total (covariates count); split it into several calls")
         target = _arr(s.values, label)
         if np.isnan(target).all():
             _bad(f"{label}: every value is null")
